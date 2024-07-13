@@ -1,6 +1,6 @@
 mod device;
 mod event_handler;
-mod protocol;
+pub mod protocol;
 mod virtio_gpu;
 mod worker;
 

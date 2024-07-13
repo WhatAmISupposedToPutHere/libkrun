@@ -71,7 +71,7 @@ LIBDIR_Linux = lib64
 LIBDIR_Darwin = lib
 
 ifeq ($(PREFIX),)
-    PREFIX := /usr/local
+    PREFIX := /usr
 endif
 
 .PHONY: install clean

@@ -9,6 +9,7 @@ use std::mem::ManuallyDrop;
 use crate::rutabaga_os::RawDescriptor;
 
 /// Wraps a RawDescriptor and safely closes it when self falls out of scope.
+#[derive(Debug)]
 pub struct SafeDescriptor {
     pub(crate) descriptor: RawDescriptor,
 }

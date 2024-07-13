@@ -9,14 +9,20 @@ use std::cmp::max;
 use std::collections::BTreeMap as Map;
 use std::collections::VecDeque;
 use std::convert::TryInto;
+use std::ffi::c_void;
 use std::fs::File;
 use std::mem::size_of;
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
-use std::thread;
-
+use std::{ptr, thread};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use libc::{c_int, FUTEX_WAKE_BITSET};
 use log::error;
+use nix::sys::mman::{MapFlags, mmap, munmap, ProtFlags};
+use nix::unistd::unlink;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
 
@@ -60,6 +66,7 @@ pub enum CrossDomainToken {
     WaylandReadPipe(u32),
     Resample,
     Kill,
+    Futex(u32),
 }
 
 const CROSS_DOMAIN_DEFAULT_BUFFER_SIZE: usize = 4096;
@@ -74,11 +81,13 @@ pub(crate) enum CrossDomainItem {
     WaylandWritePipe(File),
 }
 
+#[derive(Debug)]
 pub(crate) enum CrossDomainJob {
     HandleFence(RutabagaFence),
     #[allow(dead_code)] // `AddReadPipe` is never constructed on Windows.
     AddReadPipe(u32),
     Finish,
+    AddFutex(u32, Receiver),
 }
 
 enum RingWrite<'a, T> {
@@ -89,7 +98,9 @@ enum RingWrite<'a, T> {
 pub(crate) type CrossDomainResources = Arc<Mutex<Map<u32, CrossDomainResource>>>;
 type CrossDomainJobs = Mutex<Option<VecDeque<CrossDomainJob>>>;
 pub(crate) type CrossDomainItemState = Arc<Mutex<CrossDomainItems>>;
+pub(crate) type CrossDomainFutexes = Arc<Mutex<Map<u32, CrossDomainFutex>>>;
 
+#[derive(Debug)]
 pub(crate) struct CrossDomainResource {
     #[allow(dead_code)] // `handle` is never used on Windows.
     pub handle: Option<Arc<RutabagaHandle>>,
@@ -103,6 +114,7 @@ pub(crate) struct CrossDomainItems {
     table: Map<u32, CrossDomainItem>,
 }
 
+#[derive(Debug)]
 pub(crate) struct CrossDomainState {
     context_resources: CrossDomainResources,
     query_ring_id: u32,
@@ -120,6 +132,48 @@ struct CrossDomainWorker {
     fence_handler: RutabagaFenceHandler,
 }
 
+struct FutexPtr(*mut c_void);
+unsafe impl Send for FutexPtr {}
+pub(crate) struct CrossDomainFutex {
+    address: *mut c_void,
+    handle: SafeDescriptor,
+    watcher_thread: thread::JoinHandle<()>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl CrossDomainFutex {
+    fn watcher_thread(address: FutexPtr, shutdown: Arc<AtomicBool>, sender: Sender) {
+        let op = libc::FUTEX_WAIT_BITSET;
+        let timeout = ptr::null::<()>();
+        let uaddr2 = ptr::null::<()>();
+        let val3 = 1u32;
+        let address = address.0;
+        let atomic_val = unsafe {
+            AtomicU32::from_ptr(address as *mut u32)
+        };
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let val = atomic_val.load(Ordering::SeqCst);
+            unsafe {
+                libc::syscall(libc::SYS_futex, address, op, val, timeout, uaddr2, val3);
+            }
+            if channel_signal(&sender).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for CrossDomainFutex {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.address, 4).unwrap();
+        }
+    }
+}
+
 pub(crate) struct CrossDomainContext {
     #[allow(dead_code)] // `channels` is unused on Windows.
     pub(crate) channels: Option<Vec<RutabagaChannel>>,
@@ -127,6 +181,7 @@ pub(crate) struct CrossDomainContext {
     pub(crate) state: Option<Arc<CrossDomainState>>,
     pub(crate) context_resources: CrossDomainResources,
     pub(crate) item_state: CrossDomainItemState,
+    pub(crate) futexes: CrossDomainFutexes,
     fence_handler: RutabagaFenceHandler,
     worker_thread: Option<thread::JoinHandle<RutabagaResult<()>>>,
     pub(crate) resample_evt: Option<Sender>,
@@ -406,6 +461,16 @@ impl CrossDomainWorker {
                     }
 
                     self.fence_handler.call(fence);
+                },
+                CrossDomainToken::Futex(id) => {
+                    let mut cmd_ftx: CrossDomainFutexSignal = Default::default();
+                    cmd_ftx.hdr.cmd = CROSS_DOMAIN_CMD_FUTEX_SIGNAL;
+                    cmd_ftx.id = id;
+                    self.state.write_to_ring(
+                        RingWrite::Write(cmd_ftx, None),
+                        self.state.channel_ring_id,
+                    )?;
+                    self.fence_handler.call(fence);
                 }
                 CrossDomainToken::Kill => {
                     self.fence_handler.call(fence);
@@ -451,6 +516,9 @@ impl CrossDomainWorker {
                             .add(CrossDomainToken::WaylandReadPipe(read_pipe_id), file)?,
                         _ => return Err(RutabagaError::InvalidCrossDomainItemType),
                     }
+                }
+                CrossDomainJob::AddFutex(id, recv) => {
+                    self.wait_ctx.add(CrossDomainToken::Futex(id), recv)?;
                 }
                 CrossDomainJob::Finish => return Ok(()),
             }
@@ -596,6 +664,73 @@ impl CrossDomainContext {
         } else {
             Err(RutabagaError::InvalidCrossDomainState)
         }
+    }
+
+    fn futex_signal(&mut self, cmd_futex_signal: &CrossDomainFutexSignal) -> RutabagaResult<()> {
+        let futexes = self.futexes.lock().unwrap();
+        if let Some(ftx) = futexes.get(&cmd_futex_signal.id) {
+            let uaddr = ftx.address;
+            let op = FUTEX_WAKE_BITSET;
+            let val = c_int::MAX;
+            let timeout = ptr::null::<()>();
+            let uaddr2 = ptr::null::<()>();
+            let val3 = !1u32;
+            unsafe {
+                libc::syscall(libc::SYS_futex, uaddr, op, val, timeout, uaddr2, val3);
+            }
+            Ok(())
+        } else {
+            Err(RutabagaError::InvalidCrossDomainItemId)
+        }
+    }
+
+    fn futex_destroy(&mut self, cmd_futex_destroy: &CrossDomainFutexDestroy) -> RutabagaResult<()> {
+        let mut futexes = self.futexes.lock().unwrap();
+        match futexes.remove(&cmd_futex_destroy.id) {
+            Some(_) => Ok(()),
+            None => Err(RutabagaError::InvalidCrossDomainItemId)
+        }
+    }
+
+    fn futex_new(&mut self, cmd_futex_new: &CrossDomainFutexNew) -> RutabagaResult<()> {
+        let mut futexes = self.futexes.lock().unwrap();
+        if futexes.contains_key(&cmd_futex_new.id) {
+            return Err(RutabagaError::AlreadyInUse);
+        }
+        let path = PathBuf::from(format!(
+            "/dev/shm/shm-{}", String::from_utf8_lossy(&cmd_futex_new.filename.to_ne_bytes())
+        ));
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let handle = SafeDescriptor::from(file);
+        let address = unsafe {
+            mmap(None, 4.try_into().unwrap(), ProtFlags::PROT_WRITE | ProtFlags::PROT_READ, MapFlags::MAP_SHARED, handle.as_raw_fd(), 0)?
+        };
+        unlink(&path)?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (ftx_evt, thread_ftx_evt) = channel()?;
+
+        if let Some(state) = &self.state {
+            state.add_job(CrossDomainJob::AddFutex(cmd_futex_new.id, thread_ftx_evt));
+        } else {
+            return Err(RutabagaError::InvalidCrossDomainState);
+        }
+        let shutdown2 = shutdown.clone();
+        let fptr = FutexPtr(address);
+        let watcher_thread = thread::Builder::new()
+            .name(format!("futex watcher {}", cmd_futex_new.id))
+            .spawn(move || {
+                CrossDomainFutex::watcher_thread(fptr, shutdown2, ftx_evt);
+            })?;
+
+        futexes.insert(cmd_futex_new.id, CrossDomainFutex {
+            handle, address, watcher_thread, shutdown
+        });
+
+        Ok(())
     }
 
     fn write(&self, cmd_write: &CrossDomainReadWrite, opaque_data: &[u8]) -> RutabagaResult<()> {
@@ -835,6 +970,21 @@ impl RutabagaContext for CrossDomainContext {
 
                     self.write(&cmd_write, opaque_data)?;
                 }
+                CROSS_DOMAIN_CMD_FUTEX_NEW => {
+                    let cmd_new_futex = CrossDomainFutexNew::read_from_prefix(commands.as_bytes())
+                        .ok_or(RutabagaError::InvalidCommandBuffer)?;
+                    self.futex_new(&cmd_new_futex)?;
+                }
+                CROSS_DOMAIN_CMD_FUTEX_SIGNAL => {
+                    let cmd_futex_signal = CrossDomainFutexSignal::read_from_prefix(commands.as_bytes())
+                        .ok_or(RutabagaError::InvalidCommandBuffer)?;
+                    self.futex_signal(&cmd_futex_signal)?;
+                }
+                CROSS_DOMAIN_CMD_FUTEX_DESTROY => {
+                    let cmd_futex_destroy = CrossDomainFutexDestroy::read_from_prefix(commands.as_bytes())
+                        .ok_or(RutabagaError::InvalidCommandBuffer)?;
+                    self.futex_destroy(&cmd_futex_destroy)?;
+                }
                 _ => return Err(RutabagaError::SpecViolation("invalid cross domain command")),
             }
 
@@ -901,7 +1051,7 @@ impl RutabagaComponent for CrossDomain {
         let mut caps: CrossDomainCapabilities = Default::default();
         if let Some(ref channels) = self.channels {
             for channel in channels {
-                caps.supported_channels = 1 << channel.channel_type;
+                caps.supported_channels |= 1 << channel.channel_type;
             }
         }
 
@@ -970,6 +1120,7 @@ impl RutabagaComponent for CrossDomain {
             worker_thread: None,
             resample_evt: None,
             kill_evt: None,
+            futexes: Arc::new(Mutex::new(Default::default())),
         }))
     }
 
